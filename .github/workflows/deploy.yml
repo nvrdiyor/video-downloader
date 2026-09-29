@@ -19,6 +19,12 @@ jobs:
             cd /root/video-downloader
             git pull origin main
             npm install
+            # YouTube PO token serveri (bepul, bot tekshiruvini chetlab o'tish uchun)
+            if command -v docker >/dev/null 2>&1; then
+              docker start bgutil-provider >/dev/null 2>&1 || \
+                docker run --name bgutil-provider -d --init --restart unless-stopped \
+                  -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider || true
+            fi
             pm2 restart downloader-bot
 
       - name: Update Cobalt Cookies

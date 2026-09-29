@@ -1,16 +1,19 @@
 require('dotenv').config();
+process.env.NTBA_FIX_350 = process.env.NTBA_FIX_350 || '1';
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const { detectPlatform, extractUrl, fetchMedia, fetchAudio } = require('./lib/downloader');
+const { makeWorkDir, removeDir, createLimiter, MAX_UPLOAD, TMP_ROOT } = require('./lib/utils');
+const ytdlp = require('./lib/ytdlp');
 
 // Token .env faylidan olinadi
 const token = process.env.TELEGRAM_TOKEN;
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
-const bot = new TelegramBot(token, { polling: true });
-
-// Sizning shaxsiy serveringizdagi Cobalt API manzili
-const COBALT_API_URL = 'http://178.128.199.137:9000/';
+const botOptions = { polling: true };
+// Lokal Telegram Bot API server (2GB gacha fayllar uchun), ixtiyoriy
+if (process.env.TELEGRAM_API_URL) botOptions.baseApiUrl = process.env.TELEGRAM_API_URL;
+const bot = new TelegramBot(token, botOptions);
 
 // Users faylini saqlash
 const USERS_FILE = path.join(__dirname, 'users.json');
@@ -172,61 +175,204 @@ async function broadcastText(text) {
     return { success, fail, newBlocked };
 }
 
-// ==================== MEDIA YORDAMCHI FUNKSIYALAR ====================
+// ==================== YUKLASH VA YUBORISH ====================
 
-// Media turini aniqlash
-function isImageFile(filename) {
-    if (!filename) return false;
-    const ext = filename.split('.').pop().toLowerCase();
-    return ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext);
+const CAPTION = '<a href="https://t.me/pinterest_downloader_uzbot">pinterest_downloader_uzbot</a> dan yuklandi';
+
+// Bir vaqtda ishlaydigan yuklashlar soni (server yuklanib qolmasligi uchun)
+const limit = createLimiter(parseInt(process.env.MAX_CONCURRENT_JOBS || '4', 10));
+
+// "Musiqasini yuklash" tugmasi uchun ma'lumotlar (callback_data 64 baytdan oshmasligi kerak)
+const audioCache = new Map();
+const AUDIO_CACHE_MAX = 5000;
+
+function rememberAudio(entry) {
+    const id = Math.random().toString(36).slice(2, 10);
+    audioCache.set(id, entry);
+    while (audioCache.size > AUDIO_CACHE_MAX) {
+        audioCache.delete(audioCache.keys().next().value);
+    }
+    return id;
 }
 
-// Faylni yuklab olib, Telegramga yuborish
-async function downloadAndSend(chatId, fileUrl, filename, captionText) {
-    const tmpDir = path.join(__dirname, 'tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
+function audioKeyboard(id) {
+    return { inline_keyboard: [[{ text: '🎵 Musiqasini yuklab olish', callback_data: `a:${id}` }]] };
+}
 
-    let safeName = filename || `file_${Date.now()}`;
-    
-    // Telegram videolarni hujjat (fayl) emas, video sifatida ko'rishi uchun .mp4 qo'shamiz
-    if (!isImageFile(safeName) && !safeName.match(/\.(mp4|webm|mov|mkv)$/i)) {
-        safeName += '.mp4';
-    }
+function formatMb(bytes) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
 
-    const filePath = path.join(tmpDir, safeName);
-
-    // Faylni yuklab olish
-    const fileResponse = await axios.get(fileUrl, {
-        responseType: 'stream',
-        timeout: 120000
-    });
-
-    const writer = fs.createWriteStream(filePath);
-    fileResponse.data.pipe(writer);
-
-    await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-    });
-
-    // Telegramga yuborish
+// Bitta faylni turiga qarab yuborish (xato bo'lsa — hujjat sifatida)
+async function sendSingle(chatId, file, { caption, replyMarkup } = {}) {
+    const options = {};
+    if (caption) { options.caption = caption; options.parse_mode = 'HTML'; }
+    if (replyMarkup) options.reply_markup = replyMarkup;
     try {
-        if (isImageFile(safeName)) {
-            await bot.sendPhoto(chatId, filePath, {
-                caption: captionText,
-                parse_mode: 'HTML'
-            });
-        } else {
-            await bot.sendVideo(chatId, filePath, {
-                caption: captionText,
-                parse_mode: 'HTML'
-            });
-        }
-    } finally {
-        // Faylni o'chirish
-        try { fs.unlinkSync(filePath); } catch (e) {}
+        if (file.type === 'photo') return await bot.sendPhoto(chatId, file.path, options);
+        if (file.type === 'animation') return await bot.sendAnimation(chatId, file.path, options);
+        return await bot.sendVideo(chatId, file.path, { ...options, supports_streaming: true });
+    } catch (e) {
+        console.error(`${file.type} yuborishda xato, hujjat sifatida yuborilmoqda:`, e.message);
+        return await bot.sendDocument(chatId, file.path, options);
     }
 }
+
+// Fayllarni yuborish: bitta bo'lsa oddiy, ko'p bo'lsa 10 tadan albom qilib
+async function sendFiles(chatId, files, replyMarkup) {
+    if (files.length === 1) {
+        await sendSingle(chatId, files[0], { caption: CAPTION, replyMarkup });
+        return;
+    }
+
+    const groupable = files.filter(f => f.type === 'photo' || f.type === 'video');
+    const others = files.filter(f => !groupable.includes(f));
+    let captionUsed = false;
+    const nextCaption = () => {
+        if (captionUsed) return undefined;
+        captionUsed = true;
+        return CAPTION;
+    };
+
+    for (let i = 0; i < groupable.length; i += 10) {
+        const chunk = groupable.slice(i, i + 10);
+        if (chunk.length === 1) {
+            await sendSingle(chatId, chunk[0], { caption: nextCaption() });
+            continue;
+        }
+        const caption = nextCaption();
+        const media = chunk.map((f, idx) => {
+            const m = { type: f.type, media: f.path };
+            if (idx === 0 && caption) { m.caption = caption; m.parse_mode = 'HTML'; }
+            if (f.type === 'video') m.supports_streaming = true;
+            return m;
+        });
+        try {
+            await bot.sendMediaGroup(chatId, media);
+        } catch (e) {
+            console.error('Albom yuborishda xato, bittadan yuborilmoqda:', e.message);
+            for (let j = 0; j < chunk.length; j++) {
+                try {
+                    await sendSingle(chatId, chunk[j], { caption: j === 0 ? caption : undefined });
+                } catch (err) {
+                    console.error('Faylni yuborishda xato:', err.message);
+                }
+            }
+        }
+    }
+
+    for (const f of others) {
+        try {
+            await sendSingle(chatId, f, { caption: nextCaption() });
+        } catch (e) {
+            console.error('Faylni yuborishda xato:', e.message);
+        }
+    }
+
+    if (replyMarkup) {
+        await bot.sendMessage(chatId, '🎵 Musiqasini ham yuklab olishingiz mumkin:', { reply_markup: replyMarkup });
+    }
+}
+
+async function sendAudioFile(chatId, audio, replyTo) {
+    const title = audio.title || 'audio';
+    const options = { caption: CAPTION, parse_mode: 'HTML', title };
+    if (audio.performer) options.performer = audio.performer;
+    if (replyTo) options.reply_to_message_id = replyTo;
+    const safeName = `${title}`.replace(/[\\/:*?"<>|]+/g, '').slice(0, 80) || 'audio';
+    const ext = path.extname(audio.path) || '.mp3';
+    await bot.sendAudio(chatId, audio.path, options, { filename: `${safeName}${ext}`, contentType: ext === '.mp3' ? 'audio/mpeg' : undefined });
+}
+
+// Link bo'yicha yuklab olib, foydalanuvchiga yuborish
+async function handleLink(msg, url, platform) {
+    const chatId = msg.chat.id;
+    const status = await bot.sendMessage(chatId, 'Kuting, yuklanmoqda... ⏳', {
+        reply_to_message_id: msg.message_id,
+    }).catch(() => null);
+    const workDir = makeWorkDir();
+
+    try {
+        await limit(async () => {
+            bot.sendChatAction(chatId, 'upload_video').catch(() => {});
+            const result = await fetchMedia(url, platform, workDir);
+            const hasVideo = result.files.some(f => f.type === 'video');
+
+            // Rasmli post (slayd-shou) + musiqa — musiqani avtomatik yuboramiz,
+            // video bo'lsa — "Musiqasini yuklab olish" tugmasi
+            const autoAudio = !hasVideo && !!result.audio;
+            let replyMarkup;
+            if (!autoAudio && (hasVideo || result.audio)) {
+                replyMarkup = audioKeyboard(rememberAudio({ url, platform, audio: result.audio }));
+            }
+
+            if (result.files.length) {
+                await sendFiles(chatId, result.files, replyMarkup);
+            }
+
+            if (result.tooLarge.length) {
+                const lines = result.tooLarge.map(t => {
+                    const size = t.size ? ` (${formatMb(t.size)})` : '';
+                    return t.url ? `• <a href="${t.url.replace(/"/g, '&quot;')}">Yuklab olish havolasi</a>${size}` : `• Fayl${size}`;
+                });
+                await bot.sendMessage(chatId,
+                    `⚠️ Fayl Telegram limitidan (${formatMb(MAX_UPLOAD)}) katta, shuning uchun to'g'ridan-to'g'ri yubora olmadim:\n${lines.join('\n')}`,
+                    { parse_mode: 'HTML', disable_web_page_preview: true });
+            }
+
+            if (autoAudio) {
+                try {
+                    bot.sendChatAction(chatId, 'upload_voice').catch(() => {});
+                    const audio = await fetchAudio(url, platform, workDir, result.audio);
+                    await sendAudioFile(chatId, audio);
+                } catch (e) {
+                    console.error('Musiqani yuborishda xato:', e.message);
+                }
+            }
+        });
+    } catch (e) {
+        console.error(`Yuklash xatosi [${platform}] ${url}:`, e.message);
+        await bot.sendMessage(chatId, e.userMessage
+            ? `😔 ${e.userMessage}`
+            : "😔 Kechirasiz, bu linkdan yuklab bo'lmadi. Link to'g'riligini tekshiring yoki birozdan keyin qayta urinib ko'ring.")
+            .catch(() => {});
+    } finally {
+        removeDir(workDir);
+        if (status) bot.deleteMessage(chatId, status.message_id).catch(() => {});
+    }
+}
+
+// "🎵 Musiqasini yuklab olish" tugmasi
+bot.on('callback_query', async (query) => {
+    const data = query.data || '';
+    const chatId = query.message && query.message.chat.id;
+    if (!data.startsWith('a:') || !chatId) {
+        return bot.answerCallbackQuery(query.id).catch(() => {});
+    }
+
+    const entry = audioCache.get(data.slice(2));
+    if (!entry) {
+        return bot.answerCallbackQuery(query.id, {
+            text: 'Muddati o\'tgan. Linkni qaytadan yuboring.',
+            show_alert: true,
+        }).catch(() => {});
+    }
+
+    bot.answerCallbackQuery(query.id, { text: '🎵 Musiqa yuklanmoqda...' }).catch(() => {});
+    const workDir = makeWorkDir();
+    try {
+        await limit(async () => {
+            bot.sendChatAction(chatId, 'upload_voice').catch(() => {});
+            const audio = await fetchAudio(entry.url, entry.platform, workDir, entry.audio);
+            await sendAudioFile(chatId, audio, query.message.message_id);
+        });
+    } catch (e) {
+        console.error('Audio xatosi:', e.message);
+        bot.sendMessage(chatId, `😔 ${e.userMessage || "Musiqani yuklab bo'lmadi."}`).catch(() => {});
+    } finally {
+        removeDir(workDir);
+    }
+});
 
 // ==================== BOT XABAR HANDLER ====================
 
@@ -307,173 +453,38 @@ bot.on('message', async (msg) => {
     if (!text) return;
 
     // ---- LINK QAYTA ISHLASH ----
-    if (text.startsWith('http://') || text.startsWith('https://')) {
+    const isPrivate = msg.chat.type === 'private';
+    const url = extractUrl(text);
 
-        // 1. YouTube cheklovi
-        if (text.includes('youtube.com') || text.includes('youtu.be')) {
-            return bot.sendMessage(chatId, "Hozirda YouTube'dan yuklash cheklangan, ishlashi bilan habar beramiz.");
-        }
-
-        // 2. Ruxsat berilgan platformalar
-        if (text.includes('instagram.com') || text.includes('tiktok.com') || text.includes('vm.tiktok.com') || text.includes('pinterest.com') || text.includes('pin.it')) {
-
-            bot.sendMessage(chatId, "Kuting, yuklanmoqda... ⏳");
-
-            try {
-                const response = await axios.post(COBALT_API_URL, {
-                    url: text
-                }, {
-                    headers: {
-                        'Accept': 'application/json',
-                        'Content-Type': 'application/json'
-                    },
-                    timeout: 30000
-                });
-
-                const data = response.data;
-                const caption = '<a href="https://t.me/pinterest_downloader_uzbot">pinterest_downloader_uzbot</a> dan yuklandi';
-
-                // Natija muvaffaqiyatli bo'lsa
-                if (data.status === 'redirect' || data.status === 'tunnel') {
-                    if (isImageFile(data.filename)) {
-                        // Rasmlar — to'g'ridan-to'g'ri URL orqali yuborish
-                        try {
-                            await bot.sendPhoto(chatId, data.url, {
-                                caption: caption,
-                                parse_mode: 'HTML'
-                            });
-                        } catch (directErr) {
-                            console.error("URL orqali yuborishda xato, yuklab yuborilmoqda:", directErr.message);
-                            await downloadAndSend(chatId, data.url, data.filename, caption);
-                        }
-                    } else {
-                        // Videolar — har doim yuklab keyin yuborish
-                        await downloadAndSend(chatId, data.url, data.filename, caption);
-                    }
-                } else if (data.status === 'picker' && data.picker) {
-                    // Bir nechta rasm/video — hammasini yuklab olib, media group qilib yuborish
-                    const tmpDir = path.join(__dirname, 'tmp');
-                    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
-
-                    const downloadedFiles = [];
-
-                    for (let i = 0; i < data.picker.length; i++) {
-                        const item = data.picker[i];
-                        try {
-                            const ext = item.type === 'photo' ? '.jpg' : '.mp4';
-                            const itemFilename = `picker_${Date.now()}_${i}${ext}`;
-                            const filePath = path.join(tmpDir, itemFilename);
-
-                            const fileResponse = await axios.get(item.url, {
-                                responseType: 'stream',
-                                timeout: 120000
-                            });
-
-                            const writer = fs.createWriteStream(filePath);
-                            fileResponse.data.pipe(writer);
-
-                            await new Promise((resolve, reject) => {
-                                writer.on('finish', resolve);
-                                writer.on('error', reject);
-                            });
-
-                            downloadedFiles.push({
-                                path: filePath,
-                                type: item.type,
-                                filename: itemFilename
-                            });
-                        } catch (itemErr) {
-                            console.error("Picker item yuklashda xato:", itemErr.message);
-                        }
-                    }
-
-                    if (downloadedFiles.length === 0) {
-                        bot.sendMessage(chatId, "Fayllarni yuklab olishda muammo yuzaga keldi.");
-                    } else if (downloadedFiles.length === 1) {
-                        // Bitta fayl bo'lsa oddiy yuborish
-                        try {
-                            const file = downloadedFiles[0];
-                            if (isImageFile(file.filename)) {
-                                await bot.sendPhoto(chatId, file.path, {
-                                    caption: caption,
-                                    parse_mode: 'HTML'
-                                });
-                            } else {
-                                await bot.sendVideo(chatId, file.path, {
-                                    caption: caption,
-                                    parse_mode: 'HTML'
-                                });
-                            }
-                        } catch (e) {
-                            console.error("Bitta fayl yuborishda xato:", e.message);
-                        }
-                        try { fs.unlinkSync(downloadedFiles[0].path); } catch (e) {}
-                    } else {
-                        // Bir nechta fayl — media group qilib yuborish
-                        try {
-                            const mediaGroup = downloadedFiles.map((file, idx) => {
-                                const isImage = isImageFile(file.filename);
-                                return {
-                                    type: isImage ? 'photo' : 'video',
-                                    media: file.path,
-                                    caption: idx === 0 ? caption : '',
-                                    parse_mode: idx === 0 ? 'HTML' : undefined
-                                };
-                            });
-
-                            await bot.sendMediaGroup(chatId, mediaGroup);
-                        } catch (groupErr) {
-                            console.error("Media group yuborishda xato:", groupErr.message);
-                            // Fallback — bittadan yuborish
-                            for (let i = 0; i < downloadedFiles.length; i++) {
-                                try {
-                                    const file = downloadedFiles[i];
-                                    if (isImageFile(file.filename)) {
-                                        await bot.sendPhoto(chatId, file.path, {
-                                            caption: i === 0 ? caption : '',
-                                            parse_mode: 'HTML'
-                                        });
-                                    } else {
-                                        await bot.sendVideo(chatId, file.path, {
-                                            caption: i === 0 ? caption : '',
-                                            parse_mode: 'HTML'
-                                        });
-                                    }
-                                } catch (fallbackErr) {
-                                    console.error("Fallback yuborishda xato:", fallbackErr.message);
-                                }
-                            }
-                        }
-
-                        // Barcha temp fayllarni o'chirish
-                        for (const file of downloadedFiles) {
-                            try { fs.unlinkSync(file.path); } catch (e) {}
-                        }
-                    }
-                } else {
-                    console.error("Noma'lum API javobi:", JSON.stringify(data));
-                    bot.sendMessage(chatId, "Faylni yuklab olishda muammo yuzaga keldi.");
-                }
-            } catch (error) {
-                console.error("API Xatosi:", error.message);
-                if (error.response) {
-                    console.error("Server javobi:", JSON.stringify(error.response.data));
-                    const errCode = error.response.data?.error?.code;
-                    if (errCode === 'error.api.fetch.empty') {
-                        bot.sendMessage(chatId, "Bu kontentni yuklab bo'lmadi. Link yopiq yoki noto'g'ri bo'lishi mumkin.");
-                    } else {
-                        bot.sendMessage(chatId, "Faylni yuklab olishda xatolik yuz berdi. Iltimos keyinroq qayta urinib ko'ring.");
-                    }
-                } else {
-                    bot.sendMessage(chatId, "Server bilan ulanishda xatolik yuz berdi. Iltimos keyinroq qayta urinib ko'ring.");
-                }
-            }
-        } else {
-            bot.sendMessage(chatId, "Men faqat Instagram, TikTok, Pinterest va YouTube linklarini qabul qilaman.");
-        }
-    } else {
-        bot.sendMessage(chatId, "Iltimos, faqat link yuboring!");
+    if (!url) {
+        if (isPrivate) bot.sendMessage(chatId, "Iltimos, Instagram, TikTok, Pinterest yoki YouTube linkini yuboring!");
+        return;
     }
+
+    const platform = detectPlatform(url);
+    if (!platform) {
+        if (isPrivate) bot.sendMessage(chatId, "Men faqat Instagram, TikTok, Pinterest va YouTube linklarini qabul qilaman.");
+        return;
+    }
+
+    handleLink(msg, url, platform);
+});
+
+bot.on('polling_error', (err) => {
+    console.error('Polling xatosi:', err.code, err.message);
+});
+
+// ==================== ISHGA TUSHIRISH ====================
+
+// Eski vaqtinchalik fayllarni tozalash
+removeDir(TMP_ROOT);
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+
+// yt-dlp ni tayyorlash va har kuni yangilab turish
+ytdlp.ensure().then((ok) => {
+    if (!ok) return;
+    ytdlp.update();
+    setInterval(() => ytdlp.update(), 24 * 60 * 60 * 1000);
 });
 
 console.log('Bot ishga tushdi...');
